@@ -30,7 +30,7 @@ export default definePlugin({
     context.admin.registerSection({
       label: 'Export / Import',
       icon: 'arrow-left-right',
-      path: '/admin/plugins/@kritano/cms-plugin-io/io',
+      path: '/admin/io',
     })
 
     // Store last export timestamp
