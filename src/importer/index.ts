@@ -256,6 +256,17 @@ export async function handleImportRun(c: any): Promise<Response> {
       result.imported[collectionName] = imported
       if (skipped > 0) result.skipped[collectionName] = skipped
     }
+    // Phase 3: Import system data
+    const systemResult = await importSystemData(zip, sql, body.conflictStrategy || 'skip')
+    result.warnings.push(...systemResult.warnings)
+    if (systemResult.imported.users) result.imported['_users'] = systemResult.imported.users
+    if (systemResult.imported.roles) result.imported['_roles'] = systemResult.imported.roles
+    if (systemResult.imported.redirects) result.imported['_redirects'] = systemResult.imported.redirects
+    if (systemResult.imported.webhooks) result.imported['_webhooks'] = systemResult.imported.webhooks
+    if (systemResult.imported.forms) result.imported['_forms'] = systemResult.imported.forms
+    if (systemResult.imported.mediaFolders) result.imported['_mediaFolders'] = systemResult.imported.mediaFolders
+    if (systemResult.imported.siteSettings) result.imported['_siteSettings'] = systemResult.imported.siteSettings
+
   } catch (err) {
     result.errors.push(`Import failed: ${err instanceof Error ? err.message : err}`)
   }
@@ -264,4 +275,134 @@ export async function handleImportRun(c: any): Promise<Response> {
     success: result.errors.length === 0,
     ...result,
   })
+}
+
+async function importSystemData(
+  zip: JSZip,
+  sql: any,
+  conflictStrategy: string,
+): Promise<{ imported: Record<string, number>; warnings: string[] }> {
+  const imported: Record<string, number> = {}
+  const warnings: string[] = []
+
+  async function loadJson(path: string): Promise<any[]> {
+    const file = zip.file(path)
+    if (!file) return []
+    try { return JSON.parse(await file.async('string')) } catch { return [] }
+  }
+
+  // Import roles first (users reference roles)
+  const roles = await loadJson('system/roles.json')
+  let rolesImported = 0
+  for (const role of roles) {
+    try {
+      await sql`INSERT INTO roles (id, name, permissions, created_at) VALUES (${role.id}, ${role.name}, ${sql.json(role.permissions)}, ${role.created_at || new Date().toISOString()}) ON CONFLICT (id) DO NOTHING`
+      rolesImported++
+    } catch (err) {
+      // Try without ID (name conflict)
+      try {
+        await sql`INSERT INTO roles (name, permissions) VALUES (${role.name}, ${sql.json(role.permissions)}) ON CONFLICT (name) DO NOTHING`
+        rolesImported++
+      } catch {}
+    }
+  }
+  if (rolesImported) imported.roles = rolesImported
+
+  // Import users (without password hashes — they'll need to reset password or use OAuth)
+  const users = await loadJson('system/users.json')
+  let usersImported = 0
+  for (const user of users) {
+    try {
+      const exists = await sql`SELECT id FROM users WHERE email = ${user.email} LIMIT 1`
+      if (exists.length > 0) {
+        if (conflictStrategy === 'overwrite') {
+          await sql`UPDATE users SET name = ${user.name || null} WHERE email = ${user.email}`
+          usersImported++
+        } else {
+          warnings.push(`User ${user.email} already exists — skipped`)
+        }
+      } else {
+        // Import user with a temporary password hash (bcrypt hash of 'changeme')
+        const tempHash = '$2a$10$rQEY9SaEhyWCsFCqV4MKNOqK9B8MJmC.pfXbPzkyR2XYL8qXnFyYi'
+        await sql`INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (${user.id}, ${user.email}, ${tempHash}, ${user.name || null}, ${user.created_at || new Date().toISOString()}, ${user.updated_at || new Date().toISOString()})`
+        usersImported++
+        warnings.push(`User ${user.email} imported with temporary password 'changeme' — must change on first login`)
+      }
+    } catch (err) {
+      warnings.push(`Failed to import user ${user.email}: ${err}`)
+    }
+  }
+  if (usersImported) imported.users = usersImported
+
+  // Import user-role assignments
+  const userRoles = await loadJson('system/user-roles.json')
+  for (const ur of userRoles) {
+    try {
+      await sql`INSERT INTO user_roles (user_id, role_id) VALUES (${ur.user_id}, ${ur.role_id}) ON CONFLICT DO NOTHING`
+    } catch {}
+  }
+
+  // Import site settings
+  const settings = await loadJson('system/site-settings.json')
+  let settingsImported = 0
+  for (const setting of settings) {
+    try {
+      await sql`INSERT INTO site_settings (key, value) VALUES (${setting.key}, ${sql.json(setting.value)}) ON CONFLICT (key) DO UPDATE SET value = ${sql.json(setting.value)}`
+      settingsImported++
+    } catch {}
+  }
+  if (settingsImported) imported.siteSettings = settingsImported
+
+  // Import redirects
+  const redirects = await loadJson('system/redirects.json')
+  let redirectsImported = 0
+  for (const r of redirects) {
+    try {
+      await sql`INSERT INTO redirects (id, from_path, to_path, type, hits, created_at) VALUES (${r.id}, ${r.from_path}, ${r.to_path}, ${r.type || 301}, ${r.hits || 0}, ${r.created_at || new Date().toISOString()}) ON CONFLICT (id) DO NOTHING`
+      redirectsImported++
+    } catch {}
+  }
+  if (redirectsImported) imported.redirects = redirectsImported
+
+  // Import webhooks (without secrets — they'll need reconfiguring)
+  const webhooks = await loadJson('system/webhooks.json')
+  let webhooksImported = 0
+  for (const wh of webhooks) {
+    try {
+      await sql`INSERT INTO webhooks (id, name, url, events, active, created_at) VALUES (${wh.id}, ${wh.name}, ${wh.url}, ${sql.json(wh.events)}, ${wh.active ?? true}, ${wh.created_at || new Date().toISOString()}) ON CONFLICT (id) DO NOTHING`
+      webhooksImported++
+    } catch {}
+  }
+  if (webhooksImported) imported.webhooks = webhooksImported
+
+  // Import media folders
+  const folders = await loadJson('system/media-folders.json')
+  let foldersImported = 0
+  for (const f of folders) {
+    try {
+      await sql`INSERT INTO media_folders (id, name, parent_id, created_at) VALUES (${f.id}, ${f.name}, ${f.parent_id || null}, ${f.created_at || new Date().toISOString()}) ON CONFLICT (id) DO NOTHING`
+      foldersImported++
+    } catch {}
+  }
+  if (foldersImported) imported.mediaFolders = foldersImported
+
+  // Import forms and form fields
+  const forms = await loadJson('system/forms.json')
+  let formsImported = 0
+  for (const form of forms) {
+    try {
+      await sql`INSERT INTO forms (id, name, slug, settings, created_at) VALUES (${form.id}, ${form.name}, ${form.slug}, ${sql.json(form.settings || {})}, ${form.created_at || new Date().toISOString()}) ON CONFLICT (id) DO NOTHING`
+      formsImported++
+    } catch {}
+  }
+  if (formsImported) imported.forms = formsImported
+
+  const formFields = await loadJson('system/form-fields.json')
+  for (const ff of formFields) {
+    try {
+      await sql`INSERT INTO form_fields (id, form_id, type, label, name, required, options, sort_order) VALUES (${ff.id}, ${ff.form_id}, ${ff.type}, ${ff.label}, ${ff.name}, ${ff.required ?? false}, ${sql.json(ff.options || {})}, ${ff.sort_order || 0}) ON CONFLICT (id) DO NOTHING`
+    } catch {}
+  }
+
+  return { imported, warnings }
 }
